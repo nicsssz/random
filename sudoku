@@ -1,0 +1,744 @@
+/*
+ *  COMMANDS
+ *    SUDOKU.help()                     this help
+ *    SUDOKU.solve()                    fill every empty cell (~40 ms/cell)
+ *    SUDOKU.solve({delay:0})           instant
+ *    SUDOKU.solve({delay:150})         nice and slow
+ *    SUDOKU.solve({dryRun:true})       show what it would do
+ *    SUDOKU.solve({method:'tap'})      force the on-screen numpad (mobile)
+ *    SUDOKU.solve({method:'key'})      force keyboard events (desktop)
+ *    SUDOKU.step()                     one cell
+ *    SUDOKU.auto()                     keep solving every new puzzle
+ *    SUDOKU.auto(false)                stop auto mode
+ *    SUDOKU.board()                    print the grid
+ *    SUDOKU.solution()                 print the solved grid + consistency check
+ *    SUDOKU.state()                    mode / difficulty / progress / cages
+ *    SUDOKU.test()                     run diagnostics (incl. which input works)
+ *    SUDOKU.cfg.delay = 60             change the default speed
+ */
+(function () {
+  'use strict';
+
+  var VERSION = '2.0.0';
+  var TAG = '%cSUDOKU', CSS = 'background:#111;color:#4de1ff;padding:1px 5px;border-radius:3px;font-weight:700';
+  function log() { console.log.apply(console, [TAG, CSS].concat([].slice.call(arguments))); }
+  function warn() { console.log.apply(console, [TAG, 'background:#5a3300;color:#ffd479;padding:1px 5px;border-radius:3px;font-weight:700'].concat([].slice.call(arguments))); }
+  function bad() { console.log.apply(console, [TAG, 'background:#4a0d0d;color:#ff9a9a;padding:1px 5px;border-radius:3px;font-weight:700'].concat([].slice.call(arguments))); }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function isObj(o) { return o && typeof o === 'object'; }
+  function parse(s) { try { return JSON.parse(s); } catch (e) { return undefined; } }
+
+  var cfg = {
+    delay: 40,
+    verify: true,
+    attempts: 4,
+    crossCheck: true,
+    method: 'auto'
+  };
+  var state = { busy: false, autoTimer: null, lastTry: {}, lastRead: 0 };
+
+  var knownKey = null;
+
+  function looksLikeGame(o) {
+    if (!isObj(o) || !Array.isArray(o.values) || o.values.length !== 81) return false;
+    var s = o.solution;
+    return Array.isArray(s) ? s.length === 81 : (typeof s === 'string' && s.length === 81);
+  }
+  function deepFindGame(root, depth, budget) {
+    if (!isObj(root) || depth > 5 || budget.n++ > 6000) return null;
+    if (looksLikeGame(root)) return root;
+    for (var k in root) {
+      if (!Object.prototype.hasOwnProperty.call(root, k)) continue;
+      var v = root[k];
+      if (isObj(v)) { var r = deepFindGame(v, depth + 1, budget); if (r) return r; }
+    }
+    return null;
+  }
+  function findGame() {
+    var order = (window.mode === 'killer') ? ['main_game_killer', 'main_game'] : ['main_game', 'main_game_killer'];
+    var i, k, o, raw;
+    if (knownKey) {
+      o = parse(localStorage.getItem(knownKey));
+      if (looksLikeGame(o)) return { key: knownKey, game: o };
+      knownKey = null;
+    }
+    for (i = 0; i < order.length; i++) {
+      o = parse(localStorage.getItem(order[i]));
+      if (looksLikeGame(o)) { knownKey = order[i]; return { key: order[i], game: o }; }
+    }
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      if (order.indexOf(k) !== -1) continue;
+      raw = localStorage.getItem(k);
+      if (!raw || raw.length < 400 || raw.charAt(0) !== '{') continue;
+      o = parse(raw);
+      if (!o) continue;
+      var g = deepFindGame(o, 0, { n: 0 });
+      if (g) { knownKey = k; return { key: k, game: g }; }
+    }
+    return null;
+  }
+  function toDigits(x) {
+    if (Array.isArray(x)) return x.map(function (v) { return v | 0; });
+    if (typeof x === 'string') return x.split('').map(function (c) { return c >= '1' && c <= '9' ? parseInt(c, 10) : 0; });
+    return null;
+  }
+  function snapshot() {
+    var hit = findGame();
+    if (!hit) return null;
+    var g = hit.game, i, values = [], editable = [];
+    var mission = typeof g.mission === 'string' ? g.mission : null;
+    for (i = 0; i < 81; i++) {
+      var c = g.values[i], v = isObj(c) ? (c.val | 0) : (c | 0);
+      values.push(v);
+      var ed = isObj(c) ? c.editable !== false : true;
+      if (ed && mission && mission.charAt(i) !== '0') ed = false;
+      editable.push(ed);
+    }
+    return {
+      key: hit.key, raw: g,
+      mode: g.mode || window.mode || 'classic',
+      difficulty: g.difficulty || window.difficulty || '?',
+      id: g.id, mission: mission,
+      values: values, editable: editable,
+      solution: toDigits(g.solution),
+      cages: Array.isArray(g.cages) ? g.cages : null,
+      notes: Array.isArray(g.notes) ? g.notes : [],
+      finished: !!g.finished, timer: g.timer | 0, mistakes: g.mistakes | 0
+    };
+  }
+  function progress(st) {
+    var need = 0, have = 0, i;
+    for (i = 0; i < 81; i++) {
+      if (!st.editable[i]) continue;
+      if (st.values[i] === st.solution[i]) have++; else need++;
+    }
+    return { have: have, need: need };
+  }
+
+  function boxOf(i) { return Math.floor(i / 27) * 3 + Math.floor((i % 9) / 3); }
+
+  function countSolutions(grid, limit) {
+    limit = limit || 2;
+    var res = grid.slice();
+    var rows = [0,0,0,0,0,0,0,0,0], cols = [0,0,0,0,0,0,0,0,0], bxs = [0,0,0,0,0,0,0,0,0];
+    var i, nodes = 0, count = 0, first = null;
+    for (i = 0; i < 81; i++) {
+      var g = res[i];
+      if (g >= 1 && g <= 9) { rows[(i / 9) | 0] |= 1 << g; cols[i % 9] |= 1 << g; bxs[boxOf(i)] |= 1 << g; }
+    }
+    function rec() {
+      if (++nodes > 2e6) throw new Error('solver: too many nodes');
+      var best = -1, mask = 0, bestN = 10, k, r, c, b, v;
+      for (k = 0; k < 81; k++) {
+        if (res[k]) continue;
+        r = (k / 9) | 0; c = k % 9; b = boxOf(k);
+        var used = rows[r] | cols[c] | bxs[b], n = 0, m = 0;
+        for (v = 1; v <= 9; v++) if (!(used & (1 << v))) { n++; m |= 1 << v; }
+        if (n === 0) return;
+        if (n < bestN) { bestN = n; best = k; mask = m; if (n === 1) break; }
+      }
+      if (best === -1) {
+        count++;
+        if (!first) first = res.slice();
+        return;
+      }
+      r = (best / 9) | 0; c = best % 9; b = boxOf(best);
+      for (v = 1; v <= 9; v++) {
+        if (!(mask & (1 << v))) continue;
+        res[best] = v; rows[r] |= 1 << v; cols[c] |= 1 << v; bxs[b] |= 1 << v;
+        rec();
+        res[best] = 0; rows[r] &= ~(1 << v); cols[c] &= ~(1 << v); bxs[b] &= ~(1 << v);
+        if (count >= limit) return;
+      }
+    }
+    rec();
+    return { count: count, solution: first };
+  }
+  function cageSums(st) {
+    if (!st.cages || !st.solution) return null;
+    return st.cages.map(function (cells) {
+      var sum = 0, seen = {}, dup = false, k;
+      for (k = 0; k < cells.length; k++) {
+        var v = st.solution[cells[k]];
+        if (seen[v]) dup = true;
+        seen[v] = 1; sum += v;
+      }
+      return { cells: cells, sum: sum, dup: dup };
+    });
+  }
+
+  function cageProblems(st) {
+    var out = [], cover = new Array(81).fill(0), i, k;
+    st.cages.forEach(function (cells) { for (k = 0; k < cells.length; k++) cover[cells[k]] = (cover[cells[k]] || 0) + 1; });
+    var orphans = [], twice = [];
+    for (i = 0; i < 81; i++) { if (!cover[i]) orphans.push(i); if (cover[i] > 1) twice.push(i); }
+    if (orphans.length) out.push(orphans.length + ' cell(s) are not inside any cage');
+    if (twice.length) out.push(twice.length + ' cell(s) belong to more than one cage');
+    st.cages.forEach(function (cells, ci) {
+      var sum = 0, seen = {}, adj = {}, queue;
+      for (k = 0; k < cells.length; k++) {
+        var idx = cells[k], v = st.solution[idx];
+        if (seen[v]) out.push('cage #' + (ci + 1) + ' repeats the digit ' + v);
+        seen[v] = 1; sum += v;
+        adj[idx] = 1;
+      }
+      if (sum > 45) out.push('cage #' + (ci + 1) + ' sums to ' + sum + ' (>45)');
+      if (cells.length > 9) out.push('cage #' + (ci + 1) + ' has more than 9 cells');
+
+      if (cells.length > 1) {
+        var seenCell = {}, stack = [cells[0]], n = 0, rr, cc;
+        seenCell[cells[0]] = 1;
+        while (stack.length) {
+          var cur = stack.pop(); n++;
+          rr = (cur / 9) | 0; cc = cur % 9;
+          [[rr - 1, cc], [rr + 1, cc], [rr, cc - 1], [rr, cc + 1]].forEach(function (p) {
+            if (p[0] < 0 || p[0] > 8 || p[1] < 0 || p[1] > 8) return;
+            var ni = p[0] * 9 + p[1];
+            if (adj[ni] && !seenCell[ni]) { seenCell[ni] = 1; stack.push(ni); }
+          });
+        }
+        if (n !== cells.length) out.push('cage #' + (ci + 1) + ' is not a connected region');
+      }
+    });
+    return out;
+  }
+  function validate(st) {
+    var problems = [], i, j, sol = st.solution;
+    if (!sol || sol.length !== 81) { problems.push('no solution data in the saved game'); return problems; }
+    for (i = 0; i < 81; i++) if (!(sol[i] >= 1 && sol[i] <= 9)) problems.push('solution has a bad value at slot ' + i);
+    if (problems.length) return problems;
+    for (i = 0; i < 9; i++) {
+      var row = [], col = [], box = [], r = {}, c = {}, b = {};
+      for (j = 0; j < 9; j++) {
+        row.push(sol[i * 9 + j]);
+        col.push(sol[j * 9 + i]);
+        box.push(sol[(Math.floor(i / 3) * 3 + Math.floor(j / 3)) * 9 + (i % 3) * 3 + (j % 3)]);
+      }
+      for (j = 0; j < 9; j++) { r[row[j]] = 1; c[col[j]] = 1; b[box[j]] = 1; }
+      if (Object.keys(r).length !== 9) problems.push('row ' + (i + 1) + ' has duplicates');
+      if (Object.keys(c).length !== 9) problems.push('column ' + (i + 1) + ' has duplicates');
+      if (Object.keys(b).length !== 9) problems.push('block ' + (i + 1) + ' has duplicates');
+    }
+    if (st.mission) for (i = 0; i < 81; i++) {
+      var m = st.mission.charAt(i);
+      if (m >= '1' && m <= '9' && parseInt(m, 10) !== sol[i]) {
+        problems.push('given r' + (((i / 9) | 0) + 1) + 'c' + (i % 9 + 1) + ' contradicts the solution');
+      }
+    }
+    var sums = cageSums(st);
+    if (sums) {
+      var total = 0;
+      sums.forEach(function (s) {
+        total += s.sum;
+        if (s.dup) problems.push('cage (sum ' + s.sum + ') would repeat a digit');
+        if (s.cells.length > 9) problems.push('cage with more than 9 cells');
+        if (s.sum > 45) problems.push('cage sum ' + s.sum + ' is impossible');
+      });
+      if (total !== 405) problems.push('cage sums total ' + total + ' instead of 405');
+    }
+    if (st.cages) {
+      cageProblems(st).slice(0, 6).forEach(function (p) { problems.push(p); });
+    }
+
+    if (cfg.crossCheck && st.mission && /[1-9]/.test(st.mission)) {
+      try {
+        var givens = sol.map(function (_, k) {
+          var ch = st.mission.charAt(k);
+          return ch >= '1' && ch <= '9' ? parseInt(ch, 10) : 0;
+        });
+        var fs = countSolutions(givens, 2);
+        if (fs.count === 0) problems.push('built-in solver found no solution for these givens');
+        else if (fs.count === 1) {
+          for (i = 0; i < 81; i++) if (fs.solution[i] !== sol[i]) {
+            problems.push('independent solver disagrees at r' + (((i / 9) | 0) + 1) + 'c' + (i % 9 + 1));
+            break;
+          }
+        } else if (!st.cages) {
+          log('note: those givens alone allow several solutions (normal for some levels) — cross-check skipped');
+        }
+      } catch (e) { warn('cross-check skipped:', e.message); }
+    }
+    return problems;
+  }
+
+  function canvasEl() {
+    return document.querySelector('#game canvas') ||
+           document.querySelector('.game-wrapper canvas') ||
+           document.querySelector('#game-wrapper canvas') ||
+           document.querySelector('canvas');
+  }
+  function rectOf(el) { return el.getBoundingClientRect(); }
+
+  function mouseEvt(type, el, x, y) {
+    return new MouseEvent(type, {
+      bubbles: true, cancelable: true, view: window, button: 0, buttons: 1,
+      clientX: x, clientY: y, screenX: x, screenY: y
+    });
+  }
+  function touchEvt(type, el, x, y) {
+    if (typeof window.Touch !== 'function' || typeof window.TouchEvent !== 'function') return null;
+    try {
+      var t = new window.Touch({
+        identifier: 1, target: el, clientX: x, clientY: y, pageX: x, pageY: y,
+        screenX: x, screenY: y, radiusX: 8, radiusY: 8, force: 1
+      });
+      var empty = (type === 'touchend' || type === 'touchcancel');
+      return new window.TouchEvent(type, {
+        bubbles: true, cancelable: true, view: window, composed: true,
+        touches: empty ? [] : [t], targetTouches: empty ? [] : [t], changedTouches: [t]
+      });
+    } catch (e) { return null; }
+  }
+
+  function fire(el, x, y) {
+    var t = touchEvt('touchstart', el, x, y);
+    if (t) el.dispatchEvent(t);
+    el.dispatchEvent(mouseEvt('mousedown', el, x, y));
+    el.dispatchEvent(mouseEvt('mouseup', el, x, y));
+    if (t) el.dispatchEvent(touchEvt('touchend', el, x, y));
+  }
+  function tap(el) {
+    if (!el) return false;
+    var r = rectOf(el), x = r.left + r.width / 2, y = r.top + r.height / 2;
+    var t = touchEvt('touchstart', el, x, y);
+    if (t) el.dispatchEvent(t);
+    el.dispatchEvent(mouseEvt('mousedown', el, x, y));
+    el.dispatchEvent(mouseEvt('mouseup', el, x, y));
+    if (t) el.dispatchEvent(touchEvt('touchend', el, x, y));
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 }));
+    return true;
+  }
+
+  function selectCell(index) {
+    var el = canvasEl();
+    if (!el) return false;
+    var r = rectOf(el);
+    var x = r.left + r.width * ((index % 9) + 0.5) / 9;
+    var y = r.top + r.height * ((((index / 9) | 0)) + 0.5) / 9;
+    fire(el, x, y);
+    return true;
+  }
+  function key(code) {
+    var el = document.activeElement && document.activeElement !== document.body ? document.activeElement : window;
+    var names = { 8: 'Backspace', 46: 'Delete', 37: 'ArrowLeft', 38: 'ArrowUp', 39: 'ArrowRight', 40: 'ArrowDown' };
+    var ev = new KeyboardEvent('keydown', {
+      bubbles: true, cancelable: true, view: window,
+      key: names[code] || String.fromCharCode(code), which: code, keyCode: code
+    });
+    try { Object.defineProperty(ev, 'keyCode', { get: function () { return code; } }); } catch (e) {}
+    try { Object.defineProperty(ev, 'which', { get: function () { return code; } }); } catch (e) {}
+    window.dispatchEvent(ev);
+    if (el !== window) { try { el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: names[code] || '', keyCode: code, which: code })); } catch (e) {} }
+    return true;
+  }
+  function q(sel) { try { return document.querySelector(sel); } catch (e) { return null; } }
+
+  function numpadItem(d) {
+    return q('#numpad .numpad-item[data-value="' + d + '"]') ||
+           q('.numpad .numpad-item[data-value="' + d + '"]') ||
+           q('.numpad-item[data-value="' + d + '"]');
+  }
+  function eraseButton() {
+    return q('.game-controls-item.game-controls-erase') || q('.game-controls-erase') ||
+           q('#numpad .numpad-item[data-value="0"]') || q('.numpad-item[data-value="0"]');
+  }
+  function pencilButton() {
+    return q('.game-controls-item.game-controls-pencil') || q('.game-controls-pencil') || q('[class*="pencil"]');
+  }
+  function notesOn() { return !!q('.pencil-mode'); }
+
+  var isTouchDevice = ('ontouchstart' in window) && (navigator.maxTouchPoints || 0) > 0;
+  var pref = null;
+
+  function prefMethod() {
+    if (cfg.method === 'key' || cfg.method === 'tap') return cfg.method;
+    if (pref) return pref;
+    return isTouchDevice ? 'tap' : 'key';
+  }
+  function inputMethods() {
+    if (cfg.method === 'key' || cfg.method === 'tap') return [cfg.method];
+    var first = prefMethod();
+    var other = first === 'tap' ? 'key' : 'tap';
+    return (first === 'tap' && !numpadItem(1)) ? [other] : [first, other];
+  }
+  async function typeValue(d, how) {
+    if (how === 'tap') {
+      var el = d === 0 ? eraseButton() : numpadItem(d);
+      if (!el) return false;
+      tap(el);
+      return true;
+    }
+    key(d === 0 ? 8 : 48 + d);
+    return true;
+  }
+
+  function blankCellsByPixels() {
+    var el = canvasEl();
+    if (!el) return [];
+    var ctx;
+    try { ctx = el.getContext('2d', { willReadFrequently: true }); } catch (e) { return []; }
+    if (!ctx) return [];
+    var W = el.width, H = el.height, out = [], i;
+    try {
+      for (i = 0; i < 81; i++) {
+        var cx = Math.round(((i % 9) + 0.5) * W / 9), cy = Math.round(((((i / 9) | 0)) + 0.5) * H / 9);
+        var s = 34, d = ctx.getImageData(Math.max(0, cx - s), Math.max(0, cy - s), s * 2, s * 2).data, dark = 0;
+        for (var k = 0; k < d.length; k += 4) {
+          if (d[k] * 0.299 + d[k + 1] * 0.587 + d[k + 2] * 0.114 < 110) dark++;
+        }
+        if (dark < 12) out.push(i);
+      }
+    } catch (e) { return []; }
+    return out;
+  }
+
+  async function forceSave(quiet) {
+    var had = !!findGame();
+    var el = canvasEl();
+    if (!el) { bad('board not found — open a sudoku.com puzzle first'); return null; }
+
+    var wasNotes = notesOn(), marks = [], i;
+    if (!wasNotes) { tap(pencilButton()); await sleep(90); }
+    if (!notesOn()) { tap(pencilButton()); await sleep(90); }
+
+    if (!notesOn()) {
+      if (!quiet) warn('pencil button not found — reading whatever the game already saved');
+      return had ? snapshot() : null;
+    }
+
+    var blanks = blankCellsByPixels();
+    for (i = 0; i < 81; i++) if (blanks.indexOf(i) === -1) blanks.push(i);
+
+    var probe = 5, got = null;
+    for (i = 0; i < Math.min(blanks.length, 25); i++) {
+      var idx = blanks[i], used = prefMethod();
+      selectCell(idx); await sleep(cfg.delay);
+      await typeValue(probe, used); await sleep(Math.max(30, cfg.delay));
+      var hit = findGame();
+      if (hit) {
+        got = hit;
+        var n = (hit.game.notes || [])[idx], hasNote = false;
+        if (n) for (var z = 0; z < n.length; z++) if (n[z] === probe) hasNote = true;
+        if (hasNote) { marks.push(idx); pref = used; break; }
+        var cellVal = isObj(hit.game.values[idx]) ? hit.game.values[idx].val : 0;
+        if (cellVal === probe) {
+          selectCell(idx); await sleep(cfg.delay);
+          await typeValue(0, used); await sleep(cfg.delay);
+        }
+      }
+    }
+    for (i = 0; i < marks.length; i++) {
+      selectCell(marks[i]); await sleep(Math.max(20, cfg.delay / 2));
+      await typeValue(probe, prefMethod()); await sleep(Math.max(20, cfg.delay / 2));
+    }
+    if (!wasNotes) { tap(pencilButton()); await sleep(60); }
+
+    if (!got) {
+      if (!quiet) bad('could not read the board (no reaction to taps/keys) — run SUDOKU.test()');
+      return null;
+    }
+    if (!quiet && !had) log('board read from the running game ✔');
+    return snapshot();
+  }
+
+  function fmtGrid(vals, empty) {
+    var lines = [], r, c, bar = '  +-------+-------+-------+';
+    for (r = 0; r < 9; r++) {
+      if (r % 3 === 0) lines.push(bar);
+      var line = '  |';
+      for (c = 0; c < 9; c++) {
+        var v = vals[r * 9 + c];
+        line += ' ' + (v ? String(v) : (empty === undefined ? '.' : empty)) + (c % 3 === 2 ? ' | ' : ' ');
+      }
+      lines.push(line.replace(/\s+$/, ' ').replace(/ \| $/, ' |'));
+    }
+    lines.push(bar);
+    return lines.join('\n');
+  }
+
+  async function fillOne(index, want) {
+    var methods = inputMethods(), a, how, touched = false;
+    for (a = 0; a < cfg.attempts; a++) {
+      how = methods[a % methods.length];
+      selectCell(index);
+      await sleep(cfg.delay);
+      await typeValue(want, how);
+      await sleep(Math.max(25, cfg.delay));
+      if (!cfg.verify) { pref = how; return true; }
+
+      var now = snapshot();
+      if (!now) { pref = how; return true; }
+      if (now.values[index] === want) { pref = how; touched = true; break; }
+
+      var stray = -1;
+      for (var j = 0; j < 81; j++) {
+        if (j === index) continue;
+        if (now.values[j] === want && now.editable[j] && now.solution[j] !== want) stray = j;
+      }
+      if (stray >= 0) {
+        selectCell(stray); await sleep(cfg.delay);
+        await typeValue(0, how); await sleep(Math.max(25, cfg.delay));
+      }
+    }
+    if (!touched) return false;
+
+    if (cfg.verify) {
+      var chk = snapshot();
+      if (chk && chk.values[index] !== want) {
+        selectCell(index); await sleep(cfg.delay);
+        await typeValue(want, inputMethods()[0]); await sleep(Math.max(25, cfg.delay));
+      }
+    }
+    return true;
+  }
+
+  async function solve(opts) {
+    opts = opts || {};
+    var oldDelay = cfg.delay, oldVerify = cfg.verify, oldMethod = cfg.method;
+    if (opts.delay !== undefined) cfg.delay = opts.delay;
+    if (opts.verify !== undefined) cfg.verify = opts.verify;
+    if (opts.method !== undefined) cfg.method = opts.method;
+    try {
+      if (state.busy) { warn('already solving — wait, or SUDOKU.stop()'); return; }
+      state.busy = true;
+
+      var st = await forceSave(!!opts.quiet);
+      if (!st) { state.busy = false; return; }
+      if (!st.solution) {
+        bad('the game has no solution data yet — press Hint once (that saves the game), then run SUDOKU.solve() again');
+        state.busy = false; return;
+      }
+      var problems = validate(st);
+      if (problems.length) {
+        bad('the saved game looks inconsistent:');
+        problems.slice(0, 5).forEach(function (p) { console.log('   • ' + p); });
+        if (opts.strict !== false) { warn('aborting — rerun with {strict:false} to fill anyway'); state.busy = false; return; }
+      }
+      var todo = [], i;
+      for (i = 0; i < 81; i++) if (st.editable[i] && st.values[i] !== st.solution[i]) todo.push(i);
+      if (!todo.length) { log('already complete ✔  (' + st.mode + ' / ' + st.difficulty + ')'); state.busy = false; return; }
+
+      var p = progress(st);
+      log('mode: %c' + st.mode + ' / ' + st.difficulty + (st.id ? '  (level ' + st.id + ')' : ''),
+          'color:#fff;font-weight:700');
+      log('to fill: ' + todo.length + ' cells   input: ' + inputMethods().join(' → ') +
+          (st.cages ? '   killer cages: ' + st.cages.length : ''));
+      if (opts.dryRun) {
+        console.log(fmtGrid(st.values, '.'));
+        log('dry run — nothing was changed');
+        state.busy = false; return;
+      }
+
+      var t0 = Date.now(), failed = [], last = 0;
+      for (i = 0; i < todo.length; i++) {
+        var ok = await fillOne(todo[i], st.solution[todo[i]]);
+        if (!ok) failed.push(todo[i]);
+        if (cfg.delay >= 15 && Date.now() - last > 900) {
+          last = Date.now();
+          console.log('   ' + Math.round((i + 1) / todo.length * 100) + '%  (' + (i + 1) + '/' + todo.length + ')');
+        }
+      }
+      await sleep(150);
+      var after = snapshot(), left = 0, wrong = 0;
+      if (after) for (i = 0; i < 81; i++) {
+        if (after.editable[i] && after.values[i] !== after.solution[i]) {
+          if (after.values[i] === 0) left++; else wrong++;
+        }
+      }
+      var secs = ((Date.now() - t0) / 1000).toFixed(1);
+      if (!left && !wrong) {
+        log('%cPUZZLE SOLVED ✔%c  ' + todo.length + ' cells in ' + secs + 's',
+            'color:#00e676;font-weight:700', '');
+      } else {
+        warn(left + ' empty / ' + wrong + ' wrong after ' + secs + 's');
+        if (failed.length) warn('stubborn cells: ' + failed.map(function (k) {
+          return 'r' + (((k / 9) | 0) + 1) + 'c' + (k % 9 + 1);
+        }).join(', '));
+        warn('try: SUDOKU.test()   →   or SUDOKU.solve({delay:80, method:"tap"})');
+      }
+      state.busy = false;
+    } catch (e) {
+      state.busy = false;
+      bad('error:', e && e.message ? e.message : e);
+      throw e;
+    } finally {
+      cfg.delay = oldDelay; cfg.verify = oldVerify; cfg.method = oldMethod;
+    }
+  }
+
+  async function step() {
+    var st = await forceSave(true);
+    if (!st || !st.solution) { bad('no board data — run SUDOKU.test()'); return; }
+    for (var i = 0; i < 81; i++) {
+      if (st.editable[i] && st.values[i] !== st.solution[i]) {
+        var ok = await fillOne(i, st.solution[i]);
+        log('r' + (((i / 9) | 0) + 1) + 'c' + (i % 9 + 1) + ' = ' + st.solution[i] + (ok ? ' ✔' : ' ✖'));
+        return;
+      }
+    }
+    log('nothing left to fill ✔');
+  }
+
+  function auto(on) {
+    if (on === false) {
+      if (state.autoTimer) clearInterval(state.autoTimer);
+      state.autoTimer = null;
+      log('auto mode off');
+      return;
+    }
+    if (state.autoTimer) { log('auto mode already running'); return; }
+    log('auto mode ON — the board is solved now and again after every restart');
+    warn('(a brand-new puzzle loads a fresh page, which clears this script — paste it again, ' +
+         'or use the userscript/bookmarklet version)');
+    state.autoTimer = setInterval(async function () {
+      if (state.busy) return;
+      var st = snapshot();
+      if (!st || !st.solution) {
+
+        if (state.lastRead && Date.now() - state.lastRead < 4000) return;
+        state.lastRead = Date.now();
+        st = await forceSave(true);
+        if (!st || !st.solution) return;
+      }
+      if (st.finished) return;
+      if (!progress(st).need) return;
+      var tag = st.mode + '/' + st.difficulty + '/' + st.id;
+      var now = Date.now();
+
+      if (state.lastTry[tag] && now - state.lastTry[tag] < 20000) return;
+      state.lastTry[tag] = now;
+      await solve({ quiet: true });
+    }, 1200);
+  }
+
+  async function probeInput() {
+    var wasNotes = notesOn(), st, idx = null, i, j;
+    if (!wasNotes) { tap(pencilButton()); await sleep(110); }
+    if (!notesOn()) { if (!wasNotes) {} return { note: 'pencil (notes) mode unavailable — probe skipped to protect your lives' }; }
+
+    st = snapshot();
+    if (st) for (i = 0; i < 81; i++) if (st.editable[i] && !st.values[i]) { idx = i; break; }
+    if (idx === null) { st = await forceSave(true); if (st) for (i = 0; i < 81; i++) if (st.editable[i] && !st.values[i]) { idx = i; break; } }
+    if (idx === null) { if (!wasNotes) tap(pencilButton()); return { note: 'no empty cell to test with' }; }
+
+    var out = {}, firstWorked = null;
+    var order = (pref === 'tap' || (isTouchDevice && pref !== 'key')) ? ['tap', 'key'] : ['key', 'tap'];
+    for (var m = 0; m < 2; m++) {
+      var how = order[m];
+      if (how === 'tap' && !numpadItem(1)) { out.tap = 'no numpad'; continue; }
+      selectCell(idx); await sleep(Math.max(40, cfg.delay));
+      await typeValue(5, how); await sleep(Math.max(60, cfg.delay));
+      var after = snapshot(), note = null;
+      if (after) note = after.notes[idx];
+      var worked = !!(note && note[4] === 5);
+      out[how] = worked;
+      if (worked && !firstWorked) firstWorked = how;
+
+      selectCell(idx); await sleep(Math.max(40, cfg.delay));
+      await typeValue(5, how); await sleep(Math.max(60, cfg.delay));
+      var back = snapshot();
+      var stillThere = false;
+      if (back) { var nn = back.notes[idx]; stillThere = !!(nn && nn[4] === 5); }
+      if (stillThere) {
+        selectCell(idx); await sleep(Math.max(40, cfg.delay));
+        await typeValue(0, how); await sleep(Math.max(60, cfg.delay));
+      }
+    }
+    if (firstWorked) pref = firstWorked;
+    if (!wasNotes) { tap(pencilButton()); await sleep(80); }
+    return out;
+  }
+
+  window.SUDOKU = {
+    version: VERSION,
+    cfg: cfg,
+    get busy() { return state.busy; },
+
+    async read(o) { return (o && o.cached) ? snapshot() : await forceSave(!!(o && o.quiet)); },
+    async state() {
+      var st = await forceSave(true);
+      if (!st) { bad('no board data found'); return null; }
+      var p = progress(st), sums = cageSums(st);
+      log('mode      : ' + st.mode + ' / ' + st.difficulty + (st.id ? '  (level ' + st.id + ')' : ''));
+      log('progress  : ' + (81 - p.need) + ' / 81   (' + p.have + ' editable placed, ' + p.need + ' to go)');
+      log('timer     : ' + Math.floor(st.timer / 1000) + 's' + (st.finished ? '   — FINISHED' : ''));
+      if (sums) log('killer    : ' + sums.length + ' cages → sums ' + sums.map(function (s) { return s.sum; }).join(', '));
+      log('saved as  : ' + st.key);
+      return st;
+    },
+    async board() {
+      var st = await forceSave(true);
+      if (!st) { bad('no board data found'); return; }
+      console.log(fmtGrid(st.values, '.'));
+      var p = progress(st);
+      log((81 - p.need) + '/81 filled, ' + p.need + ' empty or wrong' + (st.finished ? '  — FINISHED' : ''));
+      return st;
+    },
+    async solution() {
+      var st = await forceSave(true);
+      if (!st || !st.solution) { bad('no solution available'); return; }
+      console.log(fmtGrid(st.solution, '?'));
+      var problems = validate(st);
+      log(problems.length ? 'consistency: ✖ ' + problems[0] : 'consistency checks: ✔ all good');
+      return st.solution;
+    },
+
+    solve: solve,
+    step: step,
+    auto: auto,
+    stop: function () { auto(false); state.busy = false; },
+
+    async test() {
+      log('SUDOKU v' + VERSION + ' diagnostic');
+      var st = await forceSave(false);
+      if (!st) { bad('no board data — is a puzzle open?'); return; }
+      var problems = validate(st), sums = cageSums(st);
+      log('device       : ' + (isTouchDevice ? 'touch (numpad taps preferred)' : 'desktop (keyboard preferred)') +
+          '   Touch API: ' + (typeof window.Touch === 'function' ? 'yes' : 'no'));
+      log('canvas       : ' + (canvasEl() ? 'found, ' + JSON.stringify(rectOf(canvasEl()).toJSON ? rectOf(canvasEl()).toJSON() : {}) : 'MISSING'));
+      log('numpad       : ' + (numpadItem(1) ? 'found (#numpad .numpad-item)' : 'not found'));
+      log('pencil/erase : ' + (pencilButton() ? 'found' : 'missing') + ' / ' + (eraseButton() ? 'found' : 'missing'));
+      log('mode / diff  : ' + st.mode + ' / ' + st.difficulty + (st.id ? '  (level ' + st.id + ')' : ''));
+      log('saved as     : ' + st.key);
+      log('cages        : ' + (sums ? sums.length + ', total ' + sums.reduce(function (a, s) { return a + s.sum; }, 0) : '—'));
+      log('blank cells  : ' + blankCellsByPixels().length + ' (by canvas pixels)');
+      log('consistency  : ' + (problems.length ? '✖ ' + problems.join(' | ') : '✔'));
+      var inp = await probeInput();
+      log('input test   : tap → ' + (inp.tap === undefined ? inp.note : inp.tap ? 'WORKS ✔' : 'no') +
+          '   key → ' + (inp.key === undefined ? inp.note : inp.key ? 'WORKS ✔' : 'no'));
+      if (cfg.method === 'auto' && inp.tap === false && inp.key === true) cfg.method = 'key';
+      else if (cfg.method === 'auto' && inp.tap === true && inp.key === false) cfg.method = 'tap';
+      log('using method : ' + cfg.method + '  (' + inputMethods().join(' → ') + ')');
+      return { state: st, problems: problems, input: inp };
+    },
+    async ping() { var st = await forceSave(false); log(st ? 'state read ✔' : 'failed'); return st; },
+    async reset() { knownKey = null; log('cache cleared'); },
+
+    help: function () {
+      var rows = [
+        ['SUDOKU.solve()', 'fill every empty cell (animated)'],
+        ['SUDOKU.solve({delay:0})', 'instant'],
+        ['SUDOKU.solve({delay:150})', 'slow and pretty'],
+        ['SUDOKU.solve({dryRun:true})', 'show what would happen'],
+        ['SUDOKU.solve({method:"tap"})', 'force on-screen numpad (mobile)'],
+        ['SUDOKU.solve({method:"key"})', 'force keyboard input (desktop)'],
+        ['SUDOKU.step()', 'fill one cell'],
+        ['SUDOKU.auto()', 'auto-solve every new puzzle'],
+        ['SUDOKU.auto(false)', 'stop auto mode'],
+        ['SUDOKU.board()', 'print the current grid'],
+        ['SUDOKU.solution()', 'print the solution'],
+        ['SUDOKU.state()', 'mode / difficulty / progress'],
+        ['SUDOKU.test()', 'diagnostics incl. input test'],
+        ['SUDOKU.cfg.delay = 60', 'default speed (ms per action)']
+      ];
+      console.log('%c SUDOKU.COM SOLVER v' + VERSION + ' ', 'background:#111;color:#4de1ff;padding:3px 8px;border-radius:4px;font-weight:700');
+      rows.forEach(function (r) { console.log('%c ' + r[0].padEnd(30), 'color:#4de1ff', r[1]); });
+      log('classic · killer · daily · postcards · storybook — desktop & mobile');
+    }
+  };
+
+  log('ready — v' + VERSION + '  •  type  %cSUDOKU.solve()%c  to solve, %cSUDOKU.test()%c to diagnose, %cSUDOKU.help()%c for everything',
+      'color:#fff;font-weight:700', '', 'color:#fff;font-weight:700', '', 'color:#fff;font-weight:700', '');
+})();
