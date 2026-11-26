@@ -1,0 +1,42 @@
+#include <iostream>
+using namespace std;
+
+float tugas, uts, uas, nilaiAkhir;
+
+void inputNilai() {
+    cout << "nilai tugas: ";
+    cin >> tugas;
+    cout << "nilai uts  : ";
+    cin >> uts;
+    cout << "nilai uas : ";
+    cin >> uas;
+}
+
+void hitungnilaiAkhir() {
+    nilaiAkhir = (tugas+uts+uas)/3;
+    cout << "Nilai Akhir: " << nilaiAkhir << endl;
+}
+
+void predikat(){
+    cout << "Predikat = " << endl;
+    if (nilaiAkhir >= 90) {
+        cout << "A";
+    } else if (nilaiAkhir >= 70) {
+        cout << "B";
+    } else if (nilaiAkhir >= 60) {
+        cout << "C";
+    } else if (nilaiAkhir >= 50) {
+        cout << "D";
+    } else {
+        cout << "E";
+    }
+   
+}
+
+int main() 
+{
+    inputNilai();
+    hitungnilaiAkhir();
+    predikat();
+    return 0;
+}
